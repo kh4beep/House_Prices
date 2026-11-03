@@ -1,0 +1,13 @@
+omegaconf==2.3.1
+numpy==2.5.1
+torch==2.13.0
+pandas==3.0.5
+tqdm==4.70.0
+scikit-learn==1.9.0
+matplotlib==3.11.2
+seaborn==0.13.2
+catboost==1.2.10
+scipy==1.18.1
+shap==0.54.1
+lightgbm==4.7.0
+xgboost==3.4.1
