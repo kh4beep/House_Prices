@@ -4,14 +4,14 @@ from omegaconf import OmegaConf
 
 config = {
     'general': {
-        'experiment_name': 'preprocessing',
+        'experiment_name': 'feature_engineering',
         'seed': 42,
-        'is_train': False,
+        'is_train': True,
         'is_rebuild_dataset': True,
         'is_refit_datatransformer': True, # False reuses saved transformers; incompatible with target-derived features (MyTargetEncoder): train rows would lose cross-fitting
         'is_save_models': True,
         'is_hold_test': True,
-        'is_eval_test': True,
+        'is_eval_test': False,
         'test_size': 0.2,
         'n_splits': 5,
         'is_shuffle': True,
@@ -35,8 +35,6 @@ config = {
     'models': {
         'params': {
             # Per-model config (key = sklearn class name or custom alias):
-            #   is_calibration: bool              wrap in CalibratedClassifierCV(**calibration_kwargs)
-            #   calibration_kwargs: dict
             #   is_hyperparameter_search: bool
             #   hyperparameter_search_kwargs:
             #       cv, n_iter, scoring
@@ -51,41 +49,90 @@ config = {
             },
             'LinearRegression':
             {
+                'is_scale_target': True,
+                'winsorization_value': 425000,
                 'kwargs': {}
             },
             'Ridge':
             {
+                'is_scale_target': True,
+                'winsorization_value': 425000,
                 'kwargs': {'random_state': '${general.seed}'}
             },
             'Lasso':
             {
-                'kwargs': {'random_state': '${general.seed}'}
+                'is_scale_target': True,
+                'winsorization_value': 425000,
+                'kwargs': {'alpha': 0.0005, 'random_state': '${general.seed}'}
             },
             'ElasticNet':
             {
-                'kwargs': {'random_state': '${general.seed}'}
+                'is_scale_target': True,
+                'winsorization_value': 425000,
+                'kwargs': {'alpha': 0.0005, 'random_state': '${general.seed}'}
             },
             'CatBoostRegressor':
             {
+                'val_size': 0.0,
+                'is_scale_target': True,
+                'winsorization_value': 425000,
                 'fit_kwargs': {'cat_features': [
                     'MSSubClass', 'MSZoning', 'Alley', 'LandContour', 'LotConfig', 'LandSlope',
                     'Neighborhood', 'BldgType', 'HouseStyle', 'RoofStyle', 'Exterior1st',
                     'Exterior2nd', 'MasVnrType', 'Foundation', 'CentralAir', 'Electrical',
                     'GarageType', 'PavedDrive', 'SaleType', 'SaleCondition'
                 ]},
-                'kwargs': {'iterations': 100, 'verbose': 0, 'allow_writing_files': False,'random_state': '${general.seed}'}
+                'kwargs': {
+                    'iterations': 100,
+                    # 'early_stopping_rounds': 50,
+                    # 'use_best_model': True,
+                    # 'eval_metric': 'RMSE',
+                    'verbose': 100,
+                    'allow_writing_files': False,
+                    'random_state': '${general.seed}'
+                }
             },
             'LGBMRegressor':
             {
-                'kwargs': {'random_state': '${general.seed}'}
+                'val_size': 0.0,
+                'is_scale_target': True,
+                'winsorization_value': 425000,
+                'kwargs': {
+                    # 'n_estimators': 2000,
+                    # 'early_stopping_round': 50,
+                    # 'metric': 'rmse',
+                    'random_state': '${general.seed}'
+                }
             },
             'XGBRegressor':
             {
-                'kwargs': {'enable_categorical': True, 'tree_method': 'hist', 'random_state': '${general.seed}'}
+                'val_size': 0.0,
+                'is_scale_target': True,
+                'winsorization_value': 425000,
+                'fit_kwargs': {'verbose': 100},
+                'kwargs': {
+                    # 'n_estimators': 2000,
+                    # 'early_stopping_rounds': 50,
+                    # 'eval_metric': 'rmse',
+                    'enable_categorical': True,
+                    'tree_method': 'hist',
+                    'random_state': '${general.seed}'
+                }
             },
             'DLM': 
             {
-                'kwargs': {'verbose': 10, 'random_state': '${general.seed}'}
+                'is_scale_target': True,
+                'winsorization_value': 425000,
+                'kwargs': {
+                    'layer_sizes': (64, 32),
+                    'dropout_values': (0.15, 0.25, 0.0),
+                    'learning_rate': 0.0003,
+                    'epochs': 300,
+                    'plateau_epochs': 30,
+                    'early_stopping': False,
+                    'verbose': 50,
+                    'random_state': '${general.seed}'
+                }
             }
         },
         'to_train': {
@@ -97,7 +144,7 @@ config = {
             'CatBoostRegressor': True,
             'LGBMRegressor': True,
             'XGBRegressor': True,
-            'DLM': False,
+            'DLM': True,
         },
         'to_inference': {
             'BaseLineLinearRegression': 0,
@@ -108,7 +155,7 @@ config = {
             'CatBoostRegressor': 1,
             'LGBMRegressor': 1,
             'XGBRegressor': 1,
-            'DLM': 0
+            'DLM': 1
         },
     }
 }

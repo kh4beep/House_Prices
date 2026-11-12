@@ -5,22 +5,26 @@ import logging
 import pandas as pd
 import numpy as np
 
-from typing import Any
-from omegaconf import DictConfig
+from typing import Any, cast
+from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
+from sklearn.base import clone
 from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from catboost import CatBoostRegressor
+from lightgbm import LGBMRegressor
+from xgboost import XGBRegressor
+from scipy.stats import norm, loguniform, uniform, randint
 
 from data_transformer import DataTransformer
 from model_trainer import ModelTrainer
-from utils import get_metrics
+from dl_model import DLM
+from hyperparameter_search import HyperparameterSearch
+from shap_explainer import ShapExplainer
+from utils import get_metrics, LogUniformInt
 
 
 class ModelManager:
-    """
-    Orchestrate CV training, OOF/hold-out evaluation and blended inference.
-    For every model and fold keeps a (DataTransformer, ModelTrainer) pair; inference
-    averages fold probabilities per model, then blends models with to_inference weights.
-    """
     def __init__(self, *, config: DictConfig) -> None:
         self.logger = logging.getLogger(__name__)
         self.config = config
@@ -34,11 +38,10 @@ class ModelManager:
 
 
     def fit(self, *, df: pd.DataFrame) -> dict:
-        """
-        Train all models from to_train with K-fold CV and evaluate them.
-        Optionally holds out a test part first. Writes oof.csv and feature importances;
-        returns artifacts with best params and OOF/test metrics.
-        """
+        os.makedirs(self.config.paths.checkpoints, exist_ok=True)
+        os.makedirs(self.config.paths.models, exist_ok=True)
+        self.models = {}
+        self.state_checkpoint = {'models': {}}
         X = df.drop('SalePrice', axis=1)
         y = df.SalePrice
         y_bins = pd.qcut(np.log1p(y), q=10, labels=False, duplicates="drop")
@@ -53,28 +56,49 @@ class ModelManager:
             )
             y_bins = pd.qcut(np.log1p(y), q=10, labels=False, duplicates="drop")
 
-
-        artifacts: dict[str, Any] = {'best_params': {}}
+        artifacts: dict[str, Any] = {'best_params': {}, 'search_best_scores': {}}
         metrics = {}
         importances = {}
         shap_importances = {}
         all_oof_predictions = {}
         splitter = StratifiedKFold(
-            n_splits=self.config.general.n_splits, 
-            shuffle=self.config.general.is_shuffle, 
+            n_splits=self.config.general.n_splits,
+            shuffle=self.config.general.is_shuffle,
             random_state=self.config.general.seed if self.config.general.is_shuffle else None
         )
         folds = list(splitter.split(X=X, y=y_bins))
 
-        for k, v in self.config.models.to_inference.items():
-            if v and not self.config.models.to_train.get(k):
-                raise ValueError(f'Model {k} has weight {v} in to_inference, but is not in to_train')
-
-        for model_name, is_train_model in self.config.models.to_train.items():
-            if not is_train_model:
+        for model_name, enabled in self.config.models.to_train.items():
+            if not enabled:
                 continue
+            data_transformer = DataTransformer(model_name=model_name, random_state=self.config.general.seed)
+            model_trainer = self._create_trainer(model_name=model_name)
+
+            params = self.config.models.params[model_name]
+            if params.get('is_hyperparameter_search', False):
+                search_kwargs = cast(
+                    dict[str, Any],
+                    OmegaConf.to_container(params.hyperparameter_search_kwargs, resolve=True)
+                )
+                search_kwargs['param_distributions'] = self._make_distributions(search_kwargs['param_distributions'])
+                search_kwargs.setdefault('random_state', self.config.general.seed)
+                search = HyperparameterSearch(
+                    data_transformer=data_transformer,
+                    model_trainer=model_trainer,
+                    **search_kwargs
+                ).fit(X, y)
+                model_trainer.estimator.set_params(**search.best_params_)
+                artifacts['best_params'][model_name] = search.best_params_
+                artifacts['search_best_scores'][model_name] = search.best_score_
+                model_path = os.path.join(self.config.paths.models, model_name)
+                os.makedirs(model_path, exist_ok=True)
+                pd.DataFrame(search.cv_results_).to_csv(os.path.join(model_path, 'search_results.csv'), index=False)
+                self.logger.info(f'{model_name} best parameters: {search.best_params_}, CV score: {search.best_score_:.6f}')
+
             all_oof_predictions[model_name] = self._train_one_model(
-                X=X, y=y, model_name=model_name, folds=folds, artifacts=artifacts, metrics=metrics, importances=importances, shap_importances=shap_importances
+                X=X, y=y, model_name=model_name, folds=folds,
+                data_transformer=data_transformer, model_trainer=model_trainer,
+                metrics=metrics, importances=importances, shap_importances=shap_importances
             )
 
         columns = {}
@@ -110,110 +134,94 @@ class ModelManager:
             metrics['ensemble']['test'] = get_metrics(y_true=y_test, y_pred=predictions)
             artifacts['test_predictions'] = predictions
 
+        if self.config.general.is_save_models:
+            self._save_state()
         artifacts['metrics'] = metrics
         return artifacts
 
 
     def predict(self, *, X: pd.DataFrame) -> np.ndarray:
-        """Return class labels: blended probabilities thresholded at predict_threshold."""
         predictions = self._blend(all_predictions=self._predict_per_model(X=X))
         return predictions
 
 
     def _train_one_model(
-            self, *, X: pd.DataFrame, y: pd.Series, model_name: str, folds: list, artifacts: dict, metrics: dict, importances: dict, shap_importances: dict
+            self, *, X: pd.DataFrame, y: pd.Series, model_name: str, folds: list, data_transformer: DataTransformer, model_trainer: ModelTrainer, metrics: dict, importances: dict, shap_importances: dict
         ) -> np.ndarray:
-        """
-        Train one model on all folds and return its OOF probabilities.
-        Hyperparameter search runs once, on the train part of fold 0; the found params
-        are reused for every fold. Fills metrics, importances and artifacts in place.
-        """
         self.logger.info(f'Start train {model_name}')
         model_checkpoint_path = os.path.join(self.config.paths.models, model_name)
         os.makedirs(model_checkpoint_path, exist_ok=True)
 
         self.models[model_name] = {}
         self.state_checkpoint['models'][model_name] = {}
-        best_params = {}
         best_epochs = []
         shap_per_fold = []
         shap_data_per_fold = []
         metrics[model_name] = {'per_fold': []}
         oof = np.zeros(len(X))
+        val_size = self.config.models.params[model_name].get('val_size', 0)
+        use_eval_set = model_name in ('CatBoostRegressor', 'LGBMRegressor', 'XGBRegressor') and val_size > 0
 
         for i, (train_index, val_index) in tqdm(enumerate(folds), total=len(folds), desc=f'Model: {model_name}'):
             fold_checkpoint_path = os.path.join(model_checkpoint_path, f'fold_{i}')
             os.makedirs(fold_checkpoint_path, exist_ok=True)
 
-            data_transformer_path = os.path.join(fold_checkpoint_path, 'transformers')
-            data_transformer = DataTransformer(
-                config=self.config, 
-                path=data_transformer_path, 
-                model_name=model_name,
-                verbose=1 if i == 0 else 0,
-            )
-
+            data_transformer_path = os.path.join(fold_checkpoint_path, 'transformer.pickle')
+            model_trainer_path = os.path.join(fold_checkpoint_path, 'model.pickle')
+            fold_data_transformer = clone(data_transformer)
+            fold_data_transformer.set_params(verbose=1 if i == 0 else 0)
+            fold_model_trainer = clone(model_trainer)
             X_train = X.iloc[train_index]
             y_train = y.iloc[train_index]
-
-            if self.config.general.is_refit_datatransformer:
-                X_train = data_transformer.fit_transform(X=X_train, y=y_train)
-            else:
-                data_transformer.load_state()
-                X_train = data_transformer.transform(X=X_train)
-
-            X_val = data_transformer.transform(X=X.iloc[val_index])
+            fit_kwargs = {}
+            if use_eval_set:
+                X_train, X_eval, y_train, y_eval = train_test_split(
+                    X_train, y_train,
+                    test_size=val_size,
+                    random_state=self.config.general.seed
+                )
+            X_train = fold_data_transformer.fit_transform(X_train, y_train)
+            X_val = fold_data_transformer.transform(X.iloc[val_index])
+            if use_eval_set:
+                X_eval = fold_data_transformer.transform(X_eval)
+                fit_kwargs['eval_set'] = [(X_eval, np.asarray(y_eval))]
             y_train = np.asarray(y_train)
             y_val = np.asarray(y.iloc[val_index])
-
-            model_trainer_path = os.path.join(fold_checkpoint_path, 'model.pickle')
-
-            if i == 0 and self.config.models.params[model_name].get('is_hyperparameter_search', False):
-                best_params = ModelTrainer(
-                    config=self.config,
-                    path=model_trainer_path,
-                    model_name=model_name
-                ).get_best_params(X=X_train, y=y_train)
-                artifacts['best_params'][model_name] = best_params
-
-            model_trainer = ModelTrainer(
-                config=self.config, 
-                path=model_trainer_path, 
-                model_name=model_name,
-                best_params=best_params
-            )
-
-            artifacts_fold = model_trainer.fit(X=X_train, y=y_train)
+            fold_model_trainer.fit(X_train, y_train, **fit_kwargs)
+            artifacts_fold = fold_model_trainer.artifacts_
             if 'history' in artifacts_fold:
-                history = {k: v for k, v in artifacts_fold['history'].items() if v}  # без early_stopping списки val_* пустые
+                history = {k: v for k, v in artifacts_fold['history'].items() if v}
                 pd.DataFrame(history).to_csv(os.path.join(fold_checkpoint_path, 'history.csv'), index=False)
                 best_epochs.append(artifacts_fold['best_epoch'])
-            val_predictions = model_trainer.predict(X=X_val)
+            val_predictions = fold_model_trainer.predict(X=X_val)
             val_metrics = get_metrics(y_true=y_val, y_pred=val_predictions)
 
             self.models[model_name][f'fold_{i}'] = {
-                'data_transformer': data_transformer, 
-                'model_trainer': model_trainer
+                'data_transformer': fold_data_transformer, 
+                'model_trainer': fold_model_trainer
             }
             self.state_checkpoint['models'][model_name][f'fold_{i}'] = {
-                'data_transformer_path': data_transformer_path, 
-                'model_trainer_path': model_trainer_path
+                'data_transformer_path': os.path.abspath(data_transformer_path), 
+                'model_trainer_path': os.path.abspath(model_trainer_path)
             }
 
             metrics[model_name]['per_fold'].append(val_metrics)
             oof[val_index] = val_predictions
 
-            names = data_transformer.get_feature_names()
-            for kind, values in model_trainer.get_feature_importance().items():
+            names = fold_data_transformer.get_feature_names()
+            for kind, values in fold_model_trainer.get_feature_importance().items():
                 importances.setdefault((model_name, kind), []).append(pd.Series(values, index=names))
 
             if self.config.general.is_shap:
-                shap_values = model_trainer.get_shap_values(X_background=X_train, X_explain=X_val)
-                grouped = data_transformer.group_by_source_feature(shap_values)
+                shap_values = ShapExplainer(
+                    predict=fold_model_trainer.predict,
+                    random_state=self.config.general.seed
+                ).get_shap_values(X_background=X_train, X_explain=X_val)
+                grouped = fold_data_transformer.group_by_source_feature(shap_values)
                 grouped.index = X.index[val_index]
                 shap_per_fold.append(grouped)
 
-                transformed_names = list(data_transformer.get_feature_names())
+                transformed_names = list(fold_data_transformer.get_feature_names())
                 transformed_values = pd.DataFrame(
                     np.asarray(X_val),
                     columns=transformed_names,
@@ -233,8 +241,8 @@ class ModelManager:
                 shap_data_per_fold.append(shap_data)
 
             if self.config.general.is_save_models:
-                self._save_models(data_transformer=data_transformer, model_trainer=model_trainer)
-                self._save_state()
+                fold_data_transformer.save_state(path=data_transformer_path)
+                fold_model_trainer.save_state(path=model_trainer_path)
 
         metrics[model_name]['oof'] = get_metrics(y_true=np.asarray(y), y_pred=oof)
         if best_epochs:
@@ -253,7 +261,6 @@ class ModelManager:
 
 
     def _predict_per_model(self, *, X: pd.DataFrame) -> dict:
-        """Average fold probabilities for every loaded model."""
         all_predictions = {}
         for model_name, fold_models in self.models.items():
             all_predictions[model_name] = np.zeros(len(X))
@@ -263,16 +270,11 @@ class ModelManager:
                 predictions = models['model_trainer'].predict(X=X_transformed)
                 all_predictions[model_name] += predictions / len(fold_models)
 
-            all_predictions[model_name] = all_predictions[model_name]
         return all_predictions
 
 
     def _blend(self, *, all_predictions: dict[str, np.ndarray]) -> np.ndarray:
-        """Weighted average of model probabilities; zero-weight models are ignored."""
-        weights = {m: float(w) for m, w in self.config.models.to_inference.items() if w > 0}
-        if not weights:
-            raise ValueError('No models with positive weight in to_inference')
-
+        weights = {name: value for name, value in self.config.models.to_inference.items() if value > 0}
         blended = np.zeros_like(all_predictions[next(iter(weights))], dtype=float)
         for model_name, weight in weights.items():
             blended += all_predictions[model_name] * weight
@@ -289,34 +291,67 @@ class ModelManager:
             self.state_checkpoint = pickle.load(f)
 
 
-    def _save_models(self, *, data_transformer: DataTransformer, model_trainer: ModelTrainer) -> None:
-        data_transformer.save_state()
-        model_trainer.save_state()
-
-
     def _load_models(self) -> None:
         self.models = {}
-        for model_name, folds in self.state_checkpoint['models'].items():
-            if not self.config.models.to_inference.get(model_name, False):
-                continue
-
+        weights = {name: value for name, value in self.config.models.to_inference.items() if value > 0}
+        for model_name in weights:
+            folds = self.state_checkpoint['models'][model_name]
             self.models[model_name] = {}
             for fold_name, paths in tqdm(folds.items(), desc=f'Model: {model_name}'):
-                data_transformer = DataTransformer(
-                    config=self.config, 
-                    path=paths['data_transformer_path'], 
-                    model_name=model_name
-                )
-                data_transformer.load_state()
-
-                model_trainer = ModelTrainer(
-                    config=self.config, 
-                    path=paths['model_trainer_path'], 
-                    model_name=model_name
-                )
-                model_trainer.load_state()
-
                 self.models[model_name][fold_name] = {
-                    'data_transformer': data_transformer, 
-                    'model_trainer': model_trainer
+                    'data_transformer': DataTransformer.load_state(path=paths['data_transformer_path']),
+                    'model_trainer': ModelTrainer.load_state(path=paths['model_trainer_path'])
                 }
+
+
+    def _create_trainer(self, *, model_name: str) -> ModelTrainer:
+        classes = {
+            'BaseLineLinearRegression': LinearRegression,
+            'LinearRegression': LinearRegression,
+            'Ridge': Ridge,
+            'Lasso': Lasso,
+            'ElasticNet': ElasticNet,
+            'CatBoostRegressor': CatBoostRegressor,
+            'LGBMRegressor': LGBMRegressor,
+            'XGBRegressor': XGBRegressor,
+            'DLM': DLM
+        }
+        if model_name not in classes:
+            raise ValueError(f'Unknown model: {model_name}')
+        params = self.config.models.params[model_name]
+        kwargs = cast(dict[str, Any], OmegaConf.to_container(params.kwargs, resolve=True))
+        fit_kwargs = cast(
+            dict[str, Any],
+            OmegaConf.to_container(params.get('fit_kwargs', OmegaConf.create({})), resolve=True)
+        )
+        return ModelTrainer(
+            estimator=classes[model_name](**kwargs),
+            is_scale_target=params.get('is_scale_target', False),
+            winsorization_value=params.get('winsorization_value'),
+            fit_kwargs=fit_kwargs
+        )
+
+
+    @staticmethod
+    def _make_distributions(spec: dict) -> dict:
+        distributions = {}
+        for name, value in spec.items():
+            if not isinstance(value, dict):
+                distributions[name] = value
+                continue
+            kind = value['type']
+            if kind == 'choice':
+                distributions[name] = value['values']
+            elif kind == 'loguniform':
+                distributions[name] = loguniform(value['a'], value['b'])
+            elif kind == 'uniform':
+                distributions[name] = uniform(loc=value['a'], scale=value['b'] - value['a'])
+            elif kind == 'int':
+                distributions[name] = randint(value['a'], value['b'] + 1)
+            elif kind == 'norm':
+                distributions[name] = norm(loc=value['a'], scale=value['b'])
+            elif kind == 'logint':
+                distributions[name] = LogUniformInt(value['a'], value['b'])
+            else:
+                raise ValueError(f'Unknown distribution type: {kind}')
+        return distributions

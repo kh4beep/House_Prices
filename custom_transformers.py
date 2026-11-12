@@ -104,70 +104,6 @@ class EstimatorImputer(BaseEstimator, TransformerMixin):
 
 
 
-class MyTargetEncoder(BaseEstimator, TransformerMixin):
-    """
-    Smoothed target rate per group, plus a flag whether the group was seen.
-    rate = (sum + smoothing * prior) / (count + smoothing), so small groups shrink to the
-    global rate. fit_transform cross-fits: each train row is encoded with stats from the
-    other folds only, otherwise its own target would leak into its feature. transform uses
-    stats from all fitted rows and is meant for unseen data only.
-    """
-    def __init__(self, *, group_cols: list[str], name: str, smoothing: float = 1.0) -> None:
-        self.group_cols = group_cols
-        self.name = name
-        self.smoothing = smoothing
-
-
-    @staticmethod
-    def _stats(X: pd.DataFrame, y: np.ndarray, group_cols: list[str]) -> pd.DataFrame:
-        return X[group_cols].assign(__y__=y).groupby(group_cols)['__y__'].agg(['count', 'sum'])
-
-
-    def _encode(self, X: pd.DataFrame, stats: pd.DataFrame, prior: float) -> tuple[np.ndarray, np.ndarray]:
-        joined = X[list(self.group_cols)].join(stats, on=list(self.group_cols))
-        n = joined['count'].fillna(0).to_numpy()
-        s = joined['sum'].fillna(0).to_numpy()
-        rate = (s + self.smoothing * prior) / (n + self.smoothing)
-        return (n > 0).astype(int), rate
-
-
-    def fit(self, X: pd.DataFrame, y=None) -> 'MyTargetEncoder':
-        if y is None:
-            raise ValueError('MyTargetEncoder requires y')
-        y = np.asarray(y, dtype=float)
-        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
-        self.stats_ = self._stats(X, y, list(self.group_cols))
-        self.prior_ = float(y.mean())
-        return self
-
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        check_is_fitted(self, 'stats_')
-        known, rate = self._encode(X, self.stats_, self.prior_)
-        return X.assign(**{f'IsGroup{self.name}': known, f'SurvivalRate{self.name}': rate})
-
-
-    def fit_transform(self, X: pd.DataFrame, y=None) -> pd.DataFrame: # type: ignore[override]
-        if y is None:
-            raise ValueError('MyTargetEncoder requires y')
-        y_arr = np.asarray(y, dtype=float)
-        known = np.zeros(len(X), dtype=int)
-        rate = np.zeros(len(X))
-        kfold = KFold(n_splits=10, shuffle=True, random_state=42)
-        for train_index, val_index in kfold.split(X):
-            stats = self._stats(X.iloc[train_index], y_arr[train_index], list(self.group_cols))
-            known[val_index], rate[val_index] = self._encode(
-                X.iloc[val_index], stats, float(y_arr[train_index].mean())
-            )
-        self.fit(X, y_arr)
-        return X.assign(**{f'IsGroup{self.name}': known, f'SurvivalRate{self.name}': rate})
-
-
-    def get_feature_names_out(self, input_features=None) -> np.ndarray:
-        return np.concatenate([self.feature_names_in_, [f'IsGroup{self.name}', f'SurvivalRate{self.name}']])
-
-
-
 class SafeCategoryTransformer(BaseEstimator, TransformerMixin):
     """
     Learns valid categories during fit. During transform, maps any value 
@@ -196,6 +132,178 @@ class SafeCategoryTransformer(BaseEstimator, TransformerMixin):
                     ordered=False
                 )
         return X
+
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
+        return self.feature_names_in_
+
+
+
+class MyTargetEncoder(BaseEstimator, TransformerMixin):
+    def __init__(self, *, group_col: str, name: str, smoothing: float = 0.1) -> None:
+        self.group_col = group_col
+        self.name = name
+        self.smoothing = smoothing
+
+
+    @staticmethod
+    def _stats(X: pd.DataFrame, y: np.ndarray, group_col: str) -> pd.DataFrame:
+        return X[[group_col]].assign(__y__=y).groupby(group_col)['__y__'].agg(['count', 'sum'])
+
+
+    def _encode(self, X: pd.DataFrame, stats: pd.DataFrame, prior: float) -> np.ndarray:
+        joined = X[[self.group_col]].join(stats, on=self.group_col)
+        n = joined['count'].fillna(0).to_numpy()
+        s = joined['sum'].fillna(0).to_numpy()
+        return (s + self.smoothing * prior) / (n + self.smoothing)
+
+
+    def fit(self, X: pd.DataFrame, y=None) -> 'MyTargetEncoder':
+        if y is None:
+            raise ValueError('MyTargetEncoder requires y')
+        y = np.asarray(y, dtype=float)
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        self.stats_ = self._stats(X, y, self.group_col)
+        self.prior_ = float(y.mean())
+        return self
+
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        check_is_fitted(self, 'stats_')
+        values = self._encode(X, self.stats_, self.prior_)
+        return X.assign(**{self.name: values})
+
+
+    def fit_transform(self, X: pd.DataFrame, y=None) -> pd.DataFrame:
+        if y is None:
+            raise ValueError('MyTargetEncoder requires y')
+        y_arr = np.asarray(y, dtype=float)
+        stats = self._stats(X, y_arr, self.group_col)
+        joined = X[[self.group_col]].join(stats, on=self.group_col)
+        n = joined['count'].to_numpy(dtype=float) - 1
+        s = joined['sum'].to_numpy(dtype=float) - y_arr
+        prior = float(y_arr.mean())
+        values = (s + self.smoothing * prior) / (n + self.smoothing)
+        self.fit(X, y_arr)
+        return X.assign(**{self.name: values})
+
+
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
+        return np.concatenate([self.feature_names_in_, [self.name]])
+
+
+
+class CombinedFeatureCreator(BaseEstimator, TransformerMixin):
+    def __init__(self, features, feature_name, operation='sum'):
+        self.features = features
+        self.feature_name = feature_name
+        self.operation = operation
+
+
+    def fit(self, X, y=None):
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        return self
+
+
+    def transform(self, X):
+        X = X.copy()
+        if self.operation == 'sum':
+            X[self.feature_name] = X[self.features].sum(axis=1)
+        elif self.operation == 'div':
+            X[self.feature_name] = X[self.features[0]] / X[self.features[1]].replace(0, np.nan)
+        elif self.operation == 'product':
+            X[self.feature_name] = X[self.features].prod(axis=1)
+        elif self.operation == 'diff':
+            X[self.feature_name] = X[self.features[0]] - X[self.features[1]]
+        return X
+
+
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
+        return np.concatenate([self.feature_names_in_, [self.feature_name]])
+
+
+class GroupFeatureCreator(BaseEstimator, TransformerMixin):
+    def __init__(self, features, feature_name, operation='sum'):
+        self.features = features
+        self.feature_name = feature_name
+        self.operation = operation
+
+
+    def fit(self, X, y=None):
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        return self
+
+
+    def transform(self, X):
+        X = X.copy()
+        if self.operation == 'sum':
+            X[self.feature_name] = X[self.features].sum(axis=1)
+        elif self.operation == 'div':
+            X[self.feature_name] = X[self.features[0]] / X[self.features[1]].replace(0, np.nan)
+        elif self.operation == 'product':
+            X[self.feature_name] = X[self.features].prod(axis=1)
+        elif self.operation == 'diff':
+            X[self.feature_name] = X[self.features[0]] - X[self.features[1]]
+        return X
+
+
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
+        return np.concatenate([self.feature_names_in_, [self.feature_name]])
+
+
+
+class GroupByFeatureCreator(BaseEstimator, TransformerMixin):
+    def __init__(self, *, group_cols, source_col, feature_name, method='mean'):
+        self.group_cols = group_cols
+        self.source_col = source_col
+        self.feature_name = feature_name
+        self.method = method
+
+
+    def fit(self, X, y=None):
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        self.group_stats_ = X.groupby(self.group_cols)[self.source_col].agg(self.method)
+        self.global_stat_ = X[self.source_col].agg(self.method)
+        return self
+
+
+    def transform(self, X):
+        check_is_fitted(self, 'group_stats_')
+        X = X.copy()
+        values = X[self.group_cols].merge(
+            self.group_stats_.rename('__group_stat__'),
+            left_on=self.group_cols,
+            right_index=True,
+            how='left',
+            sort=False
+        )['__group_stat__']
+        X[self.feature_name] = values.fillna(self.global_stat_).to_numpy()
+        return X
+
+
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
+        return np.concatenate([self.feature_names_in_, [self.feature_name]])
+
+
+
+class MaxValueClipper(BaseEstimator, TransformerMixin):
+    def __init__(self, features, percentile):
+        self.percentile = percentile
+        self.features = features
+
+
+    def fit(self, X, y=None):
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        self.thresholds_ = X[self.features].quantile(self.percentile / 100).to_dict()
+        return self
+
+
+    def transform(self, X):
+        check_is_fitted(self, 'thresholds_')
+        X = X.copy()
+        for col, threshold in self.thresholds_.items():
+            X[col] = X[col].clip(upper=threshold)
+        return X
+
 
     def get_feature_names_out(self, input_features=None) -> np.ndarray:
         return self.feature_names_in_

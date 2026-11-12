@@ -7,19 +7,27 @@ import torch
 import torch.nn as nn
 
 from torch.optim import Adam
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import root_mean_squared_error
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.utils.validation import check_is_fitted, validate_data
 
 
-class DLM(nn.Module):
-    """
-    Small MLP binary classifier with a sklearn-like interface (fit / predict_proba).
-    The network outputs logits; sigmoid is applied only in predict_proba.
-    Fitted attributes: history_ (per-epoch metrics and lr), best_epoch_, stopped_epoch_.
-    """
+class DLM(RegressorMixin, BaseEstimator):
+    n_features_in_: int
+    feature_names_in_: np.ndarray
+    net_: nn.Module
+    device_: torch.device
+    history_: dict[str, list]
+    best_epoch_: int
+    stopped_epoch_: int
+
     def __init__(
         self,
         *,
+        layer_sizes: tuple = (64, 32, 16),
+        dropout_values: tuple = (0.4, 0.4, 0.4, 0.0),
         output_size: int = 1,
         epochs: int = 100,
         batch_size: int = 32,
@@ -35,8 +43,8 @@ class DLM(nn.Module):
         verbose: int = 0,
         random_state: int = 42,
     ):
-        super().__init__()
-        self.logger = logging.getLogger(__name__)
+        self.layer_sizes = layer_sizes
+        self.dropout_values = dropout_values
         self.output_size = output_size
         self.epochs = epochs
         self.batch_size = batch_size
@@ -51,34 +59,28 @@ class DLM(nn.Module):
         self.n_iter_no_change = n_iter_no_change
         self.verbose = verbose
         self.random_state = random_state
-        self.net: nn.Module | None = None
-        self.input_size: int | None = None
-        self.history_: dict[str, list] = {}
-        self.best_epoch_: int | None = None
-        self.stopped_epoch_: int | None = None
 
 
     def _build_net(self) -> None:
-        if self.input_size is None:
-            raise RuntimeError('input_size is not set')
-        self.net = nn.Sequential(
-            nn.Linear(self.input_size, 32),
-            nn.BatchNorm1d(32),
-            nn.Hardswish(),
-            nn.Dropout(0.8),
-
-            nn.Linear(32, 16),
-            nn.BatchNorm1d(16),
-            nn.Hardswish(),
-
-            nn.Linear(16, self.output_size),
-        )
+        layers = []
+        layers.append(nn.Dropout(self.dropout_values[0]))
+        previous_size = self.n_features_in_
+        for current_size, dropout_value in zip(self.layer_sizes, self.dropout_values[1:]):
+            layers.extend([
+                nn.Linear(previous_size, current_size),
+                nn.BatchNorm1d(current_size),
+                nn.Hardswish(),
+                nn.Dropout(dropout_value),
+            ])
+            previous_size = current_size
+        layers.append(nn.Linear(previous_size, self.output_size))
+        self.net_ = nn.Sequential(*layers)
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.net is None:
+        if not hasattr(self, 'net_'):
             raise RuntimeError('net is not built, call fit or load first')
-        return self.net(x)
+        return self.net_(x)
 
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> 'DLM':
@@ -88,15 +90,21 @@ class DLM(nn.Module):
         of the best epoch by val loss are restored at the end. The schedule assumes all epochs
         run, so its decay phase may never be reached with early stopping.
         """
+        X, y = validate_data(self, X, y, dtype=np.float32, y_numeric=True, ensure_min_samples=2)
+        if not np.isfinite(y).all():
+            raise ValueError('y must contain only finite values')
+        if len(self.dropout_values) != len(self.layer_sizes) + 1:
+            raise ValueError('dropout_values must contain one value per hidden layer plus one input value')
+        if self.early_stopping and not 0 < self.validation_fraction < 1:
+            raise ValueError('validation_fraction must be in (0, 1)')
         if self.warmup_epochs + 2 * self.plateau_epochs >= self.epochs:
             raise ValueError('warmup_epochs and plateau_epochs are too large')
+        self.device_ = torch.device(self.device)
         torch.manual_seed(self.random_state)
-        rng = np.random.default_rng(self.random_state)
 
-        self.input_size = X.shape[1]
         self._build_net()
-        self.to(self.device)
-        optimizer = Adam(self.parameters(), lr=self.learning_rate)
+        self.net_.to(self.device_)
+        optimizer = Adam(self.net_.parameters(), lr=self.learning_rate)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=self._lr_multiplier)
         loss_fn = nn.MSELoss()
 
@@ -111,17 +119,27 @@ class DLM(nn.Module):
             X_val_t, y_val_t = None, None
 
         X_train_t, y_train_t = self._to_tensors(X, y)
+        if self.batch_size < 2:
+            raise ValueError('batch_size must be at least 2')
+        train_loader = DataLoader(
+            TensorDataset(X_train_t, y_train_t),
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=True,
+            generator=torch.Generator().manual_seed(self.random_state)
+        )
+        if len(train_loader) == 0:
+            raise ValueError('Training data must contain at least batch_size rows')
 
         self.history_ = {'epoch': [], 'train_loss': [], 'train_metric': [], 'val_loss': [], 'val_metric': [], 'lr': []}
         best_loss = np.inf
         best_epoch = 0
-        best_state = copy.deepcopy(self.state_dict())
+        best_state = copy.deepcopy(self.net_.state_dict())
         epochs_without_improvement = 0
-        epoch = -1
 
         for epoch in range(self.epochs):
             self.history_['lr'].append(optimizer.param_groups[0]['lr'])
-            self._train_epoch(X_train_t, y_train_t, optimizer=optimizer, loss_fn=loss_fn, rng=rng)
+            self._train_epoch(train_loader, optimizer=optimizer, loss_fn=loss_fn)
             scheduler.step()
 
             train_loss, train_metric = self._evaluate(X_train_t, y_train_t, loss_fn=loss_fn)
@@ -129,7 +147,7 @@ class DLM(nn.Module):
             self.history_['train_loss'].append(train_loss)
             self.history_['train_metric'].append(train_metric)
             if self._should_log(epoch):
-                self.logger.info(
+                logging.getLogger(__name__).info(
                     f'Epoch {epoch + 1}/{self.epochs}'
                     f'\t\tTrain loss: {train_loss:.4f}\tTrain metric: {train_metric:.4f}'
                 )
@@ -141,26 +159,22 @@ class DLM(nn.Module):
             self.history_['val_loss'].append(val_loss)
             self.history_['val_metric'].append(val_metric)
             if self._should_log(epoch):
-                self.logger.info(f'\t\t\tVal loss: {val_loss:.4f}\tVal metric: {val_metric:.4f}')
+                logging.getLogger(__name__).info(f'\t\t\tVal loss: {val_loss:.4f}\tVal metric: {val_metric:.4f}')
 
             if val_loss < best_loss - self.tol:
                 best_loss = val_loss
                 best_epoch = epoch + 1
-                best_state = copy.deepcopy(self.state_dict())
+                best_state = copy.deepcopy(self.net_.state_dict())
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
 
             if epochs_without_improvement >= self.n_iter_no_change:
-                self.logger.info(
-                    f'Early stopping on epoch {epoch + 1}, val loss {val_loss:.4f} | '
-                    f'best epoch {best_epoch}, val loss {best_loss:.4f}'
-                )
                 break
 
         self.stopped_epoch_ = epoch + 1
         if self.early_stopping:
-            self.load_state_dict(best_state)
+            self.net_.load_state_dict(best_state)
             self.best_epoch_ = best_epoch
         else:
             self.best_epoch_ = self.stopped_epoch_
@@ -169,8 +183,7 @@ class DLM(nn.Module):
 
     def get_training_artifacts(self) -> dict:
         """Return a copy of the training history and the best/stopped epochs."""
-        if not self.history_:
-            raise RuntimeError('Model is not fitted')
+        check_is_fitted(self, 'stopped_epoch_')
         return {
             'history': copy.deepcopy(self.history_),
             'best_epoch': self.best_epoch_,
@@ -207,16 +220,12 @@ class DLM(nn.Module):
 
 
     def _train_epoch(
-        self, X_t: torch.Tensor, y_t: torch.Tensor, *, optimizer: torch.optim.Optimizer, loss_fn: nn.Module, rng: np.random.Generator
+        self, train_loader: DataLoader, *, optimizer: torch.optim.Optimizer, loss_fn: nn.Module
     ) -> None:
-        self.train()
-        indices = rng.permutation(X_t.shape[0])
-        for start in range(0, len(indices), self.batch_size):
-            batch_indices = indices[start:start + self.batch_size]
-            if len(batch_indices) < 2:
-                continue
-            batch_X = X_t[batch_indices].to(self.device)
-            batch_y = y_t[batch_indices].to(self.device)
+        self.net_.train()
+        for batch_X, batch_y in train_loader:
+            batch_X = batch_X.to(self.device_)
+            batch_y = batch_y.to(self.device_)
 
             optimizer.zero_grad()
             loss = loss_fn(self.forward(batch_X), batch_y)
@@ -226,9 +235,9 @@ class DLM(nn.Module):
 
     @torch.no_grad()
     def _predict(self, X_t: torch.Tensor) -> torch.Tensor:
-        self.eval()
+        self.net_.eval()
         outputs = [
-            self.forward(X_t[start:start + self.batch_size].to(self.device)).cpu()
+            self.forward(X_t[start:start + self.batch_size].to(self.device_)).cpu()
             for start in range(0, X_t.shape[0], self.batch_size)
         ]
         return torch.cat(outputs).ravel()
@@ -238,51 +247,43 @@ class DLM(nn.Module):
         y_pred = self._predict(X_t)
         y_true = y_t.ravel()
         loss = float(loss_fn(y_pred, y_true))
-        metric = float(mean_squared_error(y_true.numpy(), y_pred.numpy()))
+        metric = float(root_mean_squared_error(y_true.numpy(), y_pred.numpy()))
         return loss, metric
 
 
     def predict(self, X: np.ndarray) -> np.ndarray:
+        check_is_fitted(self, 'stopped_epoch_')
+        X = validate_data(self, X, reset=False, dtype=np.float32)
         return self._predict(torch.tensor(X, dtype=torch.float32)).numpy()
 
 
     def save(self, *, path: str) -> None:
-        """Save constructor params, weights and training artifacts to one torch checkpoint."""
+        check_is_fitted(self, 'stopped_epoch_')
         torch.save({
-            'params': {
-                'output_size': self.output_size,
-                'epochs': self.epochs,
-                'batch_size': self.batch_size,
-                'learning_rate': self.learning_rate,
-                'warmup_epochs': self.warmup_epochs,
-                'plateau_epochs': self.plateau_epochs,
-                'min_lr_ratio': self.min_lr_ratio,
-                'device': self.device,
-                'early_stopping': self.early_stopping,
-                'tol': self.tol,
-                'validation_fraction': self.validation_fraction,
-                'n_iter_no_change': self.n_iter_no_change,
-                'verbose': self.verbose,
-                'random_state': self.random_state,
-            },
-            'input_size': self.input_size,
-            'state_dict': self.state_dict(),
-            'training_artifacts': self.get_training_artifacts() if self.history_ else None,
+            'params': self.get_params(deep=False),
+            'n_features_in': self.n_features_in_,
+            'feature_names_in': self.feature_names_in_.tolist() if hasattr(self, 'feature_names_in_') else None,
+            'state_dict': {name: value.detach().cpu() for name, value in self.net_.state_dict().items()},
+            'training_artifacts': self.get_training_artifacts(),
         }, path)
 
 
     @classmethod
-    def load(cls, *, path: str) -> 'DLM':
-        """Rebuild a fitted model from a checkpoint written by save()."""
-        ckpt = torch.load(path, map_location='cpu')
-        model = cls(**ckpt['params'])
-        model.input_size = ckpt['input_size']
+    def load(cls, *, path: str, device: str | None = None) -> 'DLM':
+        checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+        model = cls(**checkpoint['params'])
+        if device is not None:
+            model.set_params(device=device)
+        model.device_ = torch.device(model.device)
+        model.n_features_in_ = checkpoint['n_features_in']
+        if checkpoint['feature_names_in'] is not None:
+            model.feature_names_in_ = np.asarray(checkpoint['feature_names_in'], dtype=object)
         model._build_net()
-        model.load_state_dict(ckpt['state_dict'])
-        model.to(model.device)
-        artifacts = ckpt.get('training_artifacts')
-        if artifacts:
-            model.history_ = artifacts['history']
-            model.best_epoch_ = artifacts['best_epoch']
-            model.stopped_epoch_ = artifacts['stopped_epoch']
+        model.net_.load_state_dict(checkpoint['state_dict'])
+        model.net_.to(model.device_)
+        model.net_.eval()
+        artifacts = checkpoint['training_artifacts']
+        model.history_ = artifacts['history']
+        model.best_epoch_ = artifacts['best_epoch']
+        model.stopped_epoch_ = artifacts['stopped_epoch']
         return model
