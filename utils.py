@@ -6,10 +6,11 @@ import numpy as np
 import pandas as pd
 
 from scipy.stats import loguniform
-from sklearn.metrics import mean_squared_log_error, r2_score, root_mean_squared_error
+from sklearn.metrics import r2_score, root_mean_squared_error
 
 
 def symmetric_mean_absolute_percentage_error(y_true, y_pred):
+    """Return SMAPE in percent; pairs of zeros contribute zero."""
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
 
@@ -36,6 +37,7 @@ def set_seed(*, seed: int):
 
 
 def setup_logger(*, path: str) -> logging.Logger:
+    """Replace root logger handlers with file and console output."""
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
@@ -58,7 +60,7 @@ def setup_logger(*, path: str) -> logging.Logger:
 
 
 def get_metrics(*, y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    """Accuracy and F1 at the threshold, ROC AUC on probabilities."""
+    """Compute R2, SMAPE (%) and RMSLE from prices; clip negative predictions to zero."""
     y_true = np.asarray(y_true)
     y_pred = np.maximum(np.asarray(y_pred), 0)
     result = {}
@@ -69,6 +71,7 @@ def get_metrics(*, y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
 
 
 def create_submission(*, index: np.ndarray, predictions: np.ndarray, path: str) -> dict:
+    """Write Id and SalePrice to CSV and return prediction statistics."""
     artifacts = {}
     submission = pd.DataFrame({
         'Id': index,
@@ -76,7 +79,7 @@ def create_submission(*, index: np.ndarray, predictions: np.ndarray, path: str) 
     })
     submission.to_csv(path, index=False)
     artifacts['shape'] = submission.shape
-    artifacts['value_counts'] = submission['SalePrice'].value_counts()
+    artifacts['value_counts'] = submission['SalePrice'].describe()
     return artifacts
 
 
@@ -107,7 +110,6 @@ class LogUniformInt:
     Samples floor(loguniform(a, b + 1)), so both bounds get their full share. Requires a >= 1.
     """
     def __init__(self, a: int, b: int):
-        self.a, self.b = a, b
         self._dist = loguniform(a, b + 1)
 
     def rvs(self, size=None, random_state=None):

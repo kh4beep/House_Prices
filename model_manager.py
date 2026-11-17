@@ -25,6 +25,7 @@ from utils import get_metrics, LogUniformInt
 
 
 class ModelManager:
+    """Train fold models, collect OOF predictions and combine them by blending or stacking."""
     def __init__(self, *, config: DictConfig) -> None:
         self.logger = logging.getLogger(__name__)
         self.config = config
@@ -38,6 +39,7 @@ class ModelManager:
 
 
     def fit(self, *, df: pd.DataFrame) -> dict:
+        """Train on development data and optionally evaluate ensembles on a separate holdout."""
         os.makedirs(self.config.paths.checkpoints, exist_ok=True)
         os.makedirs(self.config.paths.models, exist_ok=True)
         self.models = {}
@@ -76,6 +78,7 @@ class ModelManager:
 
             params = self.config.models.params[model_name]
             if params.get('is_hyperparameter_search', False):
+                self.logger.info(f'Start hyperparameter search {model_name}')
                 search_kwargs = cast(
                     dict[str, Any],
                     OmegaConf.to_container(params.hyperparameter_search_kwargs, resolve=True)
@@ -121,18 +124,22 @@ class ModelManager:
         metrics['ensemble'] = {'oof': get_metrics(y_true=np.asarray(y), y_pred=ensemble_oof_predictions)}
         pd.DataFrame(all_oof_predictions, index=X.index).assign(target=y).to_csv(self.config.paths.oof)
 
+        self._stack_fit(all_predictions=all_oof_predictions, y_true=np.asarray(y))
+        metrics['stacking'] = {'oof': {name: np.nan for name in metrics['ensemble']['oof']}}
+
         if self.config.general.is_eval_test:
             if X_test is None or y_test is None:
                 raise ValueError('X_test or y_test is not defined')
             
             all_predictions = self._predict_per_model(X=X_test)
             predictions = self._blend(all_predictions=all_predictions)
+            stack_predictions = self._stack_predict(all_predictions=all_predictions)
 
             for model_name, preds in all_predictions.items():
                 metrics[model_name]['test'] = get_metrics(y_true=y_test, y_pred=preds)
                 
             metrics['ensemble']['test'] = get_metrics(y_true=y_test, y_pred=predictions)
-            artifacts['test_predictions'] = predictions
+            metrics['stacking']['test'] = get_metrics(y_true=y_test, y_pred=stack_predictions)
 
         if self.config.general.is_save_models:
             self._save_state()
@@ -141,7 +148,8 @@ class ModelManager:
 
 
     def predict(self, *, X: pd.DataFrame) -> np.ndarray:
-        predictions = self._blend(all_predictions=self._predict_per_model(X=X))
+        """Predict prices with the saved Ridge stack and averaged fold predictions."""
+        predictions = self._stack_predict(all_predictions=self._predict_per_model(X=X))
         return predictions
 
 
@@ -261,6 +269,7 @@ class ModelManager:
 
 
     def _predict_per_model(self, *, X: pd.DataFrame) -> dict:
+        """Average fold predictions for each loaded base model."""
         all_predictions = {}
         for model_name, fold_models in self.models.items():
             all_predictions[model_name] = np.zeros(len(X))
@@ -274,11 +283,34 @@ class ModelManager:
 
 
     def _blend(self, *, all_predictions: dict[str, np.ndarray]) -> np.ndarray:
+        """Average price predictions using positive weights from to_inference."""
         weights = {name: value for name, value in self.config.models.to_inference.items() if value > 0}
         blended = np.zeros_like(all_predictions[next(iter(weights))], dtype=float)
         for model_name, weight in weights.items():
             blended += all_predictions[model_name] * weight
         return blended / sum(weights.values())
+
+
+    def _stack_fit(self, *, all_predictions: dict[str, np.ndarray], y_true: np.ndarray):
+        """Fit Ridge on log1p OOF predictions and targets clipped at the configured limit."""
+        X_meta_train = pd.DataFrame({
+            name: np.log1p(all_predictions[name])
+            for name in self.config.models.to_stacking
+        })
+        meta_model = Ridge()
+        meta_model.fit(X_meta_train, np.log1p(np.minimum(y_true, self.config.models.stacking.winsorization_value)))
+        self.state_checkpoint['models']['meta_model'] = meta_model
+
+
+    def _stack_predict(self, *, all_predictions: dict[str, np.ndarray]):
+        """Apply Ridge to log1p base predictions and return non-negative prices."""
+        X_meta_holdout = pd.DataFrame({
+            name: np.log1p(all_predictions[name])
+            for name in self.config.models.to_stacking
+        })
+        meta_model = self.state_checkpoint['models']['meta_model']
+        pred = meta_model.predict(X_meta_holdout)
+        return np.maximum(np.expm1(pred), 0)
 
 
     def _save_state(self) -> None:
@@ -293,8 +325,7 @@ class ModelManager:
 
     def _load_models(self) -> None:
         self.models = {}
-        weights = {name: value for name, value in self.config.models.to_inference.items() if value > 0}
-        for model_name in weights:
+        for model_name in self.config.models.to_stacking:
             folds = self.state_checkpoint['models'][model_name]
             self.models[model_name] = {}
             for fold_name, paths in tqdm(folds.items(), desc=f'Model: {model_name}'):
@@ -334,6 +365,7 @@ class ModelManager:
 
     @staticmethod
     def _make_distributions(spec: dict) -> dict:
+        """Convert config specs to candidate lists or scipy-compatible distributions."""
         distributions = {}
         for name, value in spec.items():
             if not isinstance(value, dict):

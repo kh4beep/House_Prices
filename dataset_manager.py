@@ -101,6 +101,9 @@ class DatasetManager:
         df['Fence'] = df['Fence'].fillna('No_Fence')
         df['MiscFeature'] = df['MiscFeature'].fillna('No_Feature')
 
+        mask = df['YearRemodAdd'] < df['YearBuilt']
+        df.loc[mask, 'YearRemodAdd'] = df.loc[mask, 'YearBuilt']
+
         # Encode ordinal
         qual_map = {'Ex': 5, 'Gd': 4, 'TA': 3, 'Fa': 2, 'Po': 1}
         qual_map_BsmtFinType = {'GLQ': 6, 'ALQ': 5, 'BLQ': 4, 'Rec': 3, 'LwQ': 2, 'Unf': 1}

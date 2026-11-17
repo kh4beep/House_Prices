@@ -12,11 +12,11 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, QuantileTransformer, PowerTransformer, FunctionTransformer
 from sklearn.compose import ColumnTransformer
 
-from custom_transformers import on_columns, SafeCategoryTransformer, GroupStatImputer, CombinedFeatureCreator, GroupByFeatureCreator, MaxValueClipper
+from custom_transformers import on_columns, GroupStatImputer, CombinedFeatureCreator, GroupByFeatureCreator, MaxValueClipper
 
 
 class DataTransformer(TransformerMixin, BaseEstimator):
-    """Per-model preprocessing pipeline fitted on train rows only; includes target-derived features."""
+    """Fit model-specific imputation, feature engineering and encoding on training rows."""
     def __init__(self, *, model_name: str, random_state: int = 42, verbose: int = 0):
         self.model_name = model_name
         self.random_state = random_state
@@ -24,7 +24,7 @@ class DataTransformer(TransformerMixin, BaseEstimator):
 
 
     def _build_pipeline(self):
-        """Build pipeline for each model"""
+        """Build the preprocessing pipeline selected by model_name."""
         seed = self.random_state
 
         if self.model_name == 'BaseLineLinearRegression':
@@ -158,14 +158,15 @@ class DataTransformer(TransformerMixin, BaseEstimator):
                 ('new_NeighborhoodAvgLotArea', GroupByFeatureCreator(group_cols=['Neighborhood'], source_col='LotArea', feature_name='NeighborhoodAvgLotArea')),
                 ('new_NeighborhoodAvgGrLivArea', GroupByFeatureCreator(group_cols=['Neighborhood'], source_col='GrLivArea', feature_name='NeighborhoodAvgGrLivArea')),
                 ('new_NeighborhoodAvgOverallQual', GroupByFeatureCreator(group_cols=['Neighborhood'], source_col='OverallQual', feature_name='NeighborhoodAvgOverallQual')),
-                ('clean_unknown', on_columns(SafeCategoryTransformer(), 
+                ('onehot', on_columns(
+                    OneHotEncoder(drop='first', min_frequency=5, handle_unknown='infrequent_if_exist', sparse_output=False),
                     [
-                        'MSSubClass', 'MSZoning', 'Alley', 'LandContour', 'LotConfig', 'LandSlope',
-                        'Neighborhood', 'BldgType', 'HouseStyle', 'RoofStyle', 'Exterior1st',
-                        'Exterior2nd', 'MasVnrType', 'Foundation', 'CentralAir', 'Electrical',
-                        'GarageType', 'PavedDrive', 'SaleType', 'SaleCondition'
+                        'Alley', 'BldgType', 'CentralAir', 'Electrical', 'Exterior1st', 'Exterior2nd',
+                        'Foundation', 'GarageType', 'HouseStyle', 'LandContour', 'LandSlope',
+                        'LotConfig', 'MasVnrType', 'MSSubClass', 'MSZoning', 'Neighborhood',
+                        'PavedDrive', 'RoofStyle', 'SaleCondition', 'SaleType'
                     ]
-                ))
+                )),
             ])
         else:
             raise ValueError(f'Pipeline for {self.model_name} is not defined')
@@ -179,7 +180,7 @@ class DataTransformer(TransformerMixin, BaseEstimator):
 
         - rows dropped or reordered: features no longer aligned with y
         - columns renamed or reordered vs fit: a model fed an ndarray reads the wrong features
-        - NaN/inf in numeric features: tree models and DLM train on them without an error
+        - NaN/inf in numeric features: NaN is allowed only for LightGBM and XGBoost
         - mean shift vs train (warning only): fit and transform behave inconsistently
         """
         if not X_transformed.index.equals(X.index):
@@ -264,8 +265,8 @@ class DataTransformer(TransformerMixin, BaseEstimator):
         Sum per-column values (e.g. SHAP, rows x transformed columns) into source features.
         One-hot columns collapse back into their input feature; engineered columns
         have no source among the inputs and stay as they are.
-        Pass raw per-row values and aggregate afterwards: summing is exact for SHAP
-        because it is additive, while summing mean |SHAP| would overstate one-hot features.
+        Sum signed row-level contributions before taking absolute means.
+        This preserves additivity but does not recompute SHAP with grouped masking.
         """
         check_is_fitted(self, 'pipeline_')
         names = self.state_checkpoint_['feature_names']

@@ -10,6 +10,7 @@ from model_trainer import ModelTrainer
 
 
 class HyperparameterSearch:
+    """Search estimator parameters with preprocessing fitted separately within each CV fold."""
     def __init__(
         self,
         *,
@@ -35,6 +36,7 @@ class HyperparameterSearch:
 
 
     def fit(self, X: pd.DataFrame, y: pd.Series | np.ndarray, *, groups=None) -> 'HyperparameterSearch':
+        """Store CV results and best parameters without refitting the best model."""
         if 'eval_set' in (self.model_trainer.fit_kwargs or {}):
             raise ValueError('A fixed eval_set is not supported during cross-validation search')
         pipeline = Pipeline([

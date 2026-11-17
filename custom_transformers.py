@@ -3,7 +3,6 @@ import pandas as pd
 
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.utils.validation import check_is_fitted
-from sklearn.model_selection import KFold
 from sklearn.compose import ColumnTransformer
 
 
@@ -139,6 +138,7 @@ class SafeCategoryTransformer(BaseEstimator, TransformerMixin):
 
 
 class MyTargetEncoder(BaseEstimator, TransformerMixin):
+    """Add smoothed group target means; fit_transform excludes each row from group sums."""
     def __init__(self, *, group_col: str, name: str, smoothing: float = 0.1) -> None:
         self.group_col = group_col
         self.name = name
@@ -193,35 +193,7 @@ class MyTargetEncoder(BaseEstimator, TransformerMixin):
 
 
 class CombinedFeatureCreator(BaseEstimator, TransformerMixin):
-    def __init__(self, features, feature_name, operation='sum'):
-        self.features = features
-        self.feature_name = feature_name
-        self.operation = operation
-
-
-    def fit(self, X, y=None):
-        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
-        return self
-
-
-    def transform(self, X):
-        X = X.copy()
-        if self.operation == 'sum':
-            X[self.feature_name] = X[self.features].sum(axis=1)
-        elif self.operation == 'div':
-            X[self.feature_name] = X[self.features[0]] / X[self.features[1]].replace(0, np.nan)
-        elif self.operation == 'product':
-            X[self.feature_name] = X[self.features].prod(axis=1)
-        elif self.operation == 'diff':
-            X[self.feature_name] = X[self.features[0]] - X[self.features[1]]
-        return X
-
-
-    def get_feature_names_out(self, input_features=None) -> np.ndarray:
-        return np.concatenate([self.feature_names_in_, [self.feature_name]])
-
-
-class GroupFeatureCreator(BaseEstimator, TransformerMixin):
+    """Add a row-wise sum, ratio, product or difference of selected columns."""
     def __init__(self, features, feature_name, operation='sum'):
         self.features = features
         self.feature_name = feature_name
@@ -252,6 +224,7 @@ class GroupFeatureCreator(BaseEstimator, TransformerMixin):
 
 
 class GroupByFeatureCreator(BaseEstimator, TransformerMixin):
+    """Add training group statistics; unseen groups use the global statistic."""
     def __init__(self, *, group_cols, source_col, feature_name, method='mean'):
         self.group_cols = group_cols
         self.source_col = source_col
@@ -286,6 +259,7 @@ class GroupByFeatureCreator(BaseEstimator, TransformerMixin):
 
 
 class MaxValueClipper(BaseEstimator, TransformerMixin):
+    """Clip selected columns at upper percentiles learned from training rows."""
     def __init__(self, features, percentile):
         self.percentile = percentile
         self.features = features

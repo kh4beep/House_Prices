@@ -15,6 +15,7 @@ from sklearn.utils.validation import check_is_fitted, validate_data
 
 
 class DLM(RegressorMixin, BaseEstimator):
+    """Train a PyTorch MLP with BatchNorm, dropout and a scheduled learning rate."""
     n_features_in_: int
     feature_names_in_: np.ndarray
     net_: nn.Module

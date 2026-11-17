@@ -10,6 +10,7 @@ from sklearn.utils.validation import check_is_fitted
 
 
 class ModelTrainer(RegressorMixin, BaseEstimator):
+    """Wrap an estimator with target clipping, log1p and optional standardization."""
     def __init__(
         self,
         *,
@@ -33,6 +34,7 @@ class ModelTrainer(RegressorMixin, BaseEstimator):
 
 
     def fit(self, X: pd.DataFrame | np.ndarray, y: np.ndarray, **fit_params) -> 'ModelTrainer':
+        """Fit on transformed targets; eval_set targets are transformed without clipping."""
         y = self._validate_target(y)
         if len(X) != len(y):
             raise ValueError('X and y must have the same number of rows')
@@ -76,6 +78,7 @@ class ModelTrainer(RegressorMixin, BaseEstimator):
 
 
     def predict(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
+        """Return non-negative prices after reversing target scaling and log1p."""
         check_is_fitted(self, 'model_')
         if X.shape[1] != self.n_features_in_:
             raise ValueError('X must have the same number of features as at fit')
@@ -89,6 +92,7 @@ class ModelTrainer(RegressorMixin, BaseEstimator):
 
 
     def get_feature_importance(self) -> dict[str, np.ndarray]:
+        """Return available coefficients or model-specific feature importance."""
         check_is_fitted(self, 'model_')
         if hasattr(self.model_, 'coef_'):
             return {'coef': np.asarray(self.model_.coef_)}

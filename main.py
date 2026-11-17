@@ -1,6 +1,7 @@
 import os
 import time
 import shutil
+import warnings
 
 from datetime import datetime
 from pathlib import Path
@@ -11,15 +12,17 @@ from config import config
 from utils import set_seed, setup_logger, create_metrics_tables
 from runner import run
 
+warnings.filterwarnings(
+    'ignore',
+    message=r'Found unknown categories in columns .* during transform\. These unknown categories will be encoded as the infrequent category\.',
+    category=UserWarning
+)
 
 CONFIG_SOURCE = Path(__file__).resolve().parent / 'config.py'
 
 
 def save_config_snapshot(*, cfg: DictConfig, run_id: str) -> None:
-    """
-    Save the config of this run next to its checkpoints.
-    Two files per run, never overwritten: the source config.py and a resolved YAML.
-    """
+    """Replace previous config snapshots with this run's source and resolved YAML."""
     checkpoints = Path(cfg.paths.checkpoints)
     for pattern in ("config_*.py", "config_*.yaml"):
         for file in checkpoints.glob(pattern):

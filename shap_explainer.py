@@ -6,6 +6,7 @@ import shap
 
 
 class ShapExplainer:
+    """Explain a prediction callable using independent masking and a sampled background."""
     def __init__(self, *, predict: Callable, random_state: int = 42, background_size: int = 100):
         if background_size < 1:
             raise ValueError('background_size must be positive')
@@ -15,6 +16,7 @@ class ShapExplainer:
 
 
     def get_shap_values(self, *, X_background: pd.DataFrame | np.ndarray, X_explain: pd.DataFrame | np.ndarray) -> np.ndarray:
+        """Return row-by-feature contributions in the prediction callable's output units."""
         if isinstance(X_explain, pd.DataFrame) and isinstance(X_background, pd.DataFrame):
             encode, decode = self._category_codec(X_background, X_explain)
             background, explain = encode(X_background), encode(X_explain)
